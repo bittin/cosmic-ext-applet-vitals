@@ -1,38 +1,50 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use crate::configuration::app_configuration::{
-    AppConfiguration, CPU_SETTINGS_WINDOW_ID, DISK_SETTINGS_WINDOW_ID, GENERAL_SETTINGS_WINDOW_ID,
-    MAIN_SETTINGS_WINDOW_ID, MEMORY_SETTINGS_WINDOW_ID, NETWORK_SETTINGS_WINDOW_ID,
-};
-use crate::core::app_colours::AppColours;
+use crate::configuration::app_configuration::AppConfiguration;
+use crate::configuration::general::FontSizeSlot;
+use crate::core::app_fonts;
 use crate::core::app_icons::{AppIcons, APP_LOGO_ICON};
 use crate::core::app_text_measurements::AppTextMeasurements;
-use crate::core::settings::{SettingsForm, SettingsFormEvent};
 use crate::monitors::cpu_monitor::{CpuMonitor, CpuStats};
+use crate::monitors::cpu_sensors_monitor::{CpuSensorStats, CpuSensorsMonitor};
 use crate::monitors::disk_monitor::{DiskMonitor, DiskStats};
+use crate::monitors::gpu_monitor::{GpuMonitor, GpuStats};
 use crate::monitors::memory_monitor::{MemoryMonitor, MemoryStats};
 use crate::monitors::network_monitor::{NetworkMonitor, NetworkStats};
-use crate::sensors::proc_disk_stats_reader::ProcDiskStatsReader;
+use crate::monitors::storage_monitor::{StorageMonitor, StorageStats};
+use crate::sensors::cpu_info_reader::{CpuInfo, PROC_CPUINFO_FILE};
+use crate::sensors::cpu_topology_reader::{CpuTopology, SYSFS_CPU_ROOT};
+use crate::sensors::gpu_reader::GpuPaths;
+use crate::sensors::hwmon_reader::HWMON_ROOT;
+use crate::sensors::proc_disk_stats_reader::{ProcDiskStatsReader, SYS_BLOCK_ROOT};
 use crate::sensors::proc_meminfo_reader::ProcMemInfoSensorReader;
+use crate::sensors::proc_mounts_reader::ProcMountsReader;
 use crate::sensors::proc_net_dev_reader::ProcNetDevReader;
 use crate::sensors::proc_stat_reader::ProcStatSensorReader;
+use crate::sensors::storage_reader::StorageReader;
+use crate::settings_app::{SettingsPage, SettingsPageRequest, SETTINGS_FLAG};
+use crate::ui::components::detail_popup::PopupStyle;
+use crate::ui::components::indicator_area::indicator_area;
+use crate::ui::components::indicator::indicator;
+use crate::ui::components::indicator_strip::indicator_strip;
 use crate::ui::components::no_indicator::{no_indicators_content, NoIndicatorProps};
-use crate::ui::settings_forms::main_settings_form::MainSettingsForm;
 use cosmic::app::{Core, Task};
 use cosmic::applet::cosmic_panel_config::{PanelAnchor, PanelSize};
-use cosmic::config::{CosmicTk, COSMIC_TK};
-use cosmic::cosmic_config::{Config, CosmicConfigEntry};
+use cosmic::cosmic_config::CosmicConfigEntry;
 use cosmic::font::Font;
-use cosmic::iced::{window, Subscription};
-use cosmic::iced::{Alignment, Limits};
-use cosmic::iced_widget::{row, Column, Row};
-use cosmic::iced_winit::commands::popup::get_popup;
+use cosmic::iced::platform_specific::runtime::wayland::popup::SctkPopupSettings;
+use cosmic::iced::platform_specific::shell::commands::popup::{destroy_popup, get_popup};
+use cosmic::iced::{window, Alignment, Padding, Point, Rectangle, Size, Subscription};
 use cosmic::widget;
 use cosmic::widget::{autosize, container, divider, Id};
 use cosmic::{cosmic_config, Application, Element};
-use log::{error, info};
+use log::{error, info, warn};
 use once_cell::sync::Lazy;
-use std::collections::BTreeMap;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+use tokio::sync::watch;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 pub const GLOBAL_APP_ID: &'static str = "dev.eidolon.cosmic-ext-applet-vitals";
@@ -43,59 +55,121 @@ const DEFAULT_INDICATOR_FONT_SIZE: u16 = 11;
 const DEFAULT_INDICATOR_ICON_SIZE: u16 = 11;
 const DEFAULT_INDICATOR_SPACING: u16 = 8;
 
+/// How long the cursor has to rest on an indicator before its detail popup opens, so sweeping the cursor across the
+/// panel doesn't flash popups open.
+const DETAIL_POPUP_DELAY: Duration = Duration::from_millis(400);
+
+/// Identifies an indicator, e.g. to know which one's detail popup to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndicatorKind {
+    Cpu,
+    Memory,
+    Gpu,
+    Network,
+    Disk,
+    Storage,
+}
+
+impl IndicatorKind {
+    /// The settings page that clicking the indicator opens.
+    fn settings_page(self) -> SettingsPage {
+        match self {
+            IndicatorKind::Cpu => SettingsPage::Cpu,
+            IndicatorKind::Memory => SettingsPage::Memory,
+            IndicatorKind::Gpu => SettingsPage::Gpu,
+            IndicatorKind::Network => SettingsPage::Network,
+            IndicatorKind::Disk => SettingsPage::Disk,
+            IndicatorKind::Storage => SettingsPage::Storage,
+        }
+    }
+}
+
+/// The detail popup for the indicator under the cursor. It opens after [`DETAIL_POPUP_DELAY`].
+#[derive(Debug)]
+struct DetailPopup {
+    kind: IndicatorKind,
+    /// The indicator's bounds in the applet, which the popup is anchored to.
+    bounds: Rectangle,
+    /// Identifies this hover, so the delayed open of an earlier hover is ignored.
+    hover: u64,
+    /// The popup's window, once it has opened.
+    window_id: Option<window::Id>,
+}
+
 #[derive(Default)]
 pub struct AppState {
     /// Application state which is managed by the COSMIC runtime.
     core: Core,
     /// The cancellation token to stop the status updates
     monitor_cancellation_token: Option<CancellationToken>,
-    /// The active system font
-    active_interface_font: Font,
-    /// The colours available to the application
-    app_colours: AppColours,
+    interface_font: Font,
+    indicator_font: Font,
     /// The icons available to the application
     app_icons: AppIcons,
     /// The text measurements for indicator labels to prevent jittering as labels change size
     app_text_measurements: AppTextMeasurements,
     /// The application configuration
     configuration: AppConfiguration,
-    /// The settings forms that are available for configuration of the monitors.
-    settings_forms: BTreeMap<window::Id, SettingsForm>,
     /// The current memory usage stats
     memory: MemoryStats,
     /// The current cpu usage stats
     cpu: CpuStats,
+    /// The cpu's model, cores, threads and highest clock speed, which don't change, so they're read once.
+    cpu_info: CpuInfo,
+    /// The latest cpu temperature, fan speed and clock speed, which are only read while the cpu detail popup is wanted.
+    cpu_sensors: CpuSensorStats,
+    /// The current gpu usage stats. Only the panel's gpu is read, except while the gpu detail popup is wanted.
+    gpu: GpuStats,
+    /// Tells the monitors which indicator's detail popup is wanted, so they only read what only it shows while it is.
+    detail_wanted: watch::Sender<Option<IndicatorKind>>,
     /// The current network usage stats
     network: NetworkStats,
     /// The current disk usage stats   
     disk: DiskStats,
-    /// The popup id.
-    popup: Option<window::Id>,
+    /// The current available and total storage
+    storage: StorageStats,
+    /// The settings window process, if one has been launched. See [`crate::settings_app`] for why it is separate.
+    settings_process: Option<Child>,
+    /// The detail popup for the hovered indicator, if one is hovered.
+    detail_popup: Option<DetailPopup>,
+    /// Counts the hovers over indicators, to identify each one.
+    hover_count: u64,
+}
+
+/// Monitors that fall due within this window of each other are polled together, so they share one redraw.
+const MONITOR_COALESCE_WINDOW: Duration = Duration::from_millis(50);
+
+/// The results of a single monitor tick. Only the monitors that were due are populated.
+#[derive(Debug, Clone, Default)]
+pub struct StatsUpdate {
+    memory: Option<MemoryStats>,
+    cpu: Option<CpuStats>,
+    cpu_sensors: Option<CpuSensorStats>,
+    gpu: Option<GpuStats>,
+    network: Option<NetworkStats>,
+    disk: Option<DiskStats>,
+    storage: Option<StorageStats>,
 }
 
 /// The messages processed by the application update
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// Toggle the main settings popup
-    SettingsPopupOpened(window::Id),
-    /// A settings popup was closed
-    SettingsPopupClosed(window::Id),
+    /// Open the settings window on a page, or show the page if the window is already open
+    OpenSettingsWindow(SettingsPage),
     /// Start monitoring the system resources
     StartMonitoring,
-    /// The memory usage stats were updated
-    MemoryUpdate(MemoryStats),
-    /// The cpu usage stats were updated
-    CpuUpdate(CpuStats),
-    /// The network usage stats were updated
-    NetworkUpdate(NetworkStats),
-    /// The disk usage stats were updated
-    DiskUpdate(DiskStats),
-    /// The user has updated the settings form
-    SettingsFormUpdate(SettingsFormEvent),
+    /// One or more monitors were polled. Updates are batched so each tick causes a single redraw.
+    StatsUpdate(StatsUpdate),
     /// The configuration file was changed externally
     ConfigFileChanged(AppConfiguration),
-    /// The COSMIC DE theme was changed
-    ThemeChanged(CosmicTk),
+    /// The cursor entered an indicator, which has these bounds
+    IndicatorHovered(IndicatorKind, Rectangle),
+    /// The cursor left an indicator
+    IndicatorUnhovered(IndicatorKind),
+    /// The cursor has rested on an indicator long enough to open its detail popup. Identifies the hover.
+    OpenDetailPopup(u64),
+    /// A popup was closed by the compositor
+    PopupClosed(window::Id),
 }
 
 impl Application for AppState {
@@ -123,33 +197,24 @@ impl Application for AppState {
             })
             .unwrap_or_default();
 
-        let settings_forms = configuration.settings_form_options();
-        let app_colours = AppColours::from(&core.system_theme().cosmic().palette);
         let app_icons = AppIcons::new();
         let app_text_measurements = AppTextMeasurements::new();
-        let active_interface_font: Font = COSMIC_TK
-            .read()
-            .expect("No COSMIC_TK configuration found")
-            .interface_font
-            .clone()
-            .into();
+
+        let interface_font = cosmic::font::default();
+        let indicator_font = app_fonts::resolve_font(&configuration.general.font, &interface_font);
 
         let app = AppState {
             core,
-            settings_forms,
-            active_interface_font,
-            app_colours,
+            interface_font,
+            indicator_font,
             app_icons,
             app_text_measurements,
             configuration,
+            cpu_info: CpuInfo::read(Path::new(PROC_CPUINFO_FILE), Path::new(SYSFS_CPU_ROOT)),
             ..Default::default()
         };
 
         (app, cosmic::task::message(Message::StartMonitoring))
-    }
-
-    fn on_close_requested(&self, id: window::Id) -> Option<Message> {
-        Some(Message::SettingsPopupClosed(id))
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
@@ -161,62 +226,162 @@ impl Application for AppState {
                 .map(|update| Message::ConfigFileChanged(update.config)),
         );
 
-        subscriptions.push(
-            self.core()
-                .watch_config("com.system76.CosmicTk")
-                .map(|tk| Message::ThemeChanged(tk.config)),
-        );
-
         Subscription::batch(subscriptions)
     }
 
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
-        match message {
-            Message::SettingsPopupOpened(target_id) => {
-                info!("Opening settings popup with id: {}", target_id);
+        let task = self.handle_message(message);
+        self.sync_detail_wanted();
+        task
+    }
 
-                match self.popup {
-                    None => {
-                        self.popup = Some(MAIN_SETTINGS_WINDOW_ID.clone());
-                        // Ensure the configuration is up to date when we open the settings form.
-                        self.refresh_configuration_from_disk();
-                    }
-                    Some(_) => self.popup = Some(target_id),
-                };
+    fn view(&self) -> Element<'_, Self::Message> {
+        let is_horizontal = is_horizontal(&self.core);
 
-                if target_id != MAIN_SETTINGS_WINDOW_ID.clone() {
-                    return Task::none();
-                }
+        let indicators = [
+            (IndicatorKind::Cpu, self.cpu.content(&self.configuration)),
+            (IndicatorKind::Memory, self.memory.content(&self.configuration)),
+            (IndicatorKind::Gpu, self.gpu.content(&self.configuration)),
+            (IndicatorKind::Network, self.network.content(&self.configuration)),
+            (IndicatorKind::Disk, self.disk.content(&self.configuration)),
+            (IndicatorKind::Storage, self.storage.content(&self.configuration, is_horizontal)),
+        ];
+        let mut contents: Vec<(Element<Message>, Option<IndicatorKind>)> = indicators
+            .into_iter()
+            .filter_map(|(kind, content)| Some((indicator(self, is_horizontal, content?), Some(kind))))
+            .collect();
+        if contents.is_empty() {
+            let content = no_indicators_content(NoIndicatorProps {
+                icon: self.app_icons.get(APP_LOGO_ICON),
+                size: self.icon_size(),
+            });
+            contents.push((content, None));
+        }
 
-                let mut popup_settings = self.core.applet.get_popup_settings(
-                    self.core.main_window_id().unwrap(),
-                    MAIN_SETTINGS_WINDOW_ID.clone(),
-                    None,
-                    None,
-                    None,
+        // The minor-axis padding, which is what `suggested_padding` returned before it also reported the major axis.
+        let (_, applet_padding) = self.core.applet.suggested_padding(false);
+        let applet_padding = f32::from(applet_padding);
+        let show_separators = self.configuration.general.show_indicator_separators;
+
+        // The applet's padding, and the gaps between indicators, belong to the indicators rather than the button and
+        // strip, so each indicator's hover area and highlight reach the applet's edges and the next indicator.
+        // Separators keep the applet's padding along the panel, so they aren't drawn on its edge.
+        let across = if is_horizontal { applet_padding } else { 1.0 };
+        let gap = if is_horizontal { f32::from(DEFAULT_INDICATOR_SPACING) } else { 0.0 };
+        let half_gap = gap / 2.0;
+        let spacing = if show_separators { half_gap } else { 0.0 };
+        let edge = if show_separators { half_gap } else { applet_padding };
+        let count = contents.len();
+
+        let separator = || -> Element<Message> {
+            // Inset across the panel, so it's the length of the indicators' text rather than the applet's thickness.
+            let inset = if is_horizontal { [applet_padding, 0.0] } else { [0.0, 0.0] };
+            container(divider::vertical::default()).padding(inset).into()
+        };
+
+        let mut elements: Vec<Element<Message>> = Vec::new();
+        if show_separators {
+            elements.push(separator());
+        }
+        for (index, (content, kind)) in contents.into_iter().enumerate() {
+            let before = if index == 0 { edge } else { half_gap };
+            let after = if index + 1 == count { edge } else { half_gap };
+            let padding = if is_horizontal {
+                Padding { top: across, right: after, bottom: across, left: before }
+            } else {
+                Padding { top: before, right: across, bottom: after, left: across }
+            };
+            let content: Element<Message> = container(content)
+                .padding(padding)
+                .align_x(Alignment::Center)
+                .align_y(Alignment::Center)
+                .into();
+            let page = kind.map_or(SettingsPage::General, IndicatorKind::settings_page);
+            let mut area = indicator_area(content, Message::OpenSettingsWindow(page));
+            // Every indicator has a detail popup.
+            if let Some(kind) = kind {
+                area = area.on_hover(
+                    move |bounds| Message::IndicatorHovered(kind, bounds),
+                    Message::IndicatorUnhovered(kind),
                 );
-
-                popup_settings.positioner.size_limits = Limits::NONE
-                    .max_width(372.0)
-                    .min_width(300.0)
-                    .min_height(200.0)
-                    .max_height(1080.0);
-
-                return get_popup(popup_settings);
             }
-            Message::SettingsPopupClosed(id) => {
-                if id == MAIN_SETTINGS_WINDOW_ID.clone() {
-                    info!("Closing main settings window");
-                    self.popup = None;
-                    self.save_configuration();
-                    return cosmic::task::message(Message::StartMonitoring);
-                }
+            elements.push(area.into());
+            if show_separators {
+                elements.push(separator());
+            }
+        }
+
+        let wrapper = indicator_strip(is_horizontal, spacing, elements);
+
+        let padding = match (show_separators, is_horizontal) {
+            (false, _) => Padding::ZERO,
+            (true, true) => Padding::from([0.0, applet_padding]),
+            (true, false) => Padding::from([applet_padding, 0.0]),
+        };
+
+        // The indicators highlight themselves, so the button keeps its resting look while hovered or pressed rather
+        // than highlighting the whole applet. Clicking it away from an indicator, e.g. on a separator, opens the
+        // general settings.
+        let resting = |focused: bool, theme: &cosmic::Theme| {
+            widget::button::Catalog::active(theme, focused, false, &cosmic::theme::Button::AppletIcon)
+        };
+        let button = widget::button::custom(wrapper)
+            .class(cosmic::theme::Button::Custom {
+                active: Box::new(resting),
+                disabled: Box::new(move |theme| resting(false, theme)),
+                hovered: Box::new(resting),
+                pressed: Box::new(resting),
+            })
+            .padding(padding)
+            .on_press(Message::OpenSettingsWindow(SettingsPage::General));
+
+        autosize::autosize(container(button), AUTOSIZE_MAIN_ID.clone()).into()
+    }
+
+    fn view_window(&self, id: window::Id) -> Element<'_, Self::Message> {
+        let content = match &self.detail_popup {
+            Some(popup) if popup.window_id == Some(id) => self.detail_popup_content(popup.kind),
+            _ => None,
+        };
+        match content {
+            Some(content) => self.core.applet.popup_container(content).into(),
+            None => widget::Space::new().into(),
+        }
+    }
+
+    fn on_close_requested(&self, id: window::Id) -> Option<Self::Message> {
+        Some(Message::PopupClosed(id))
+    }
+
+    fn style(&self) -> Option<cosmic::iced::theme::Style> {
+        Some(cosmic::applet::style())
+    }
+
+    /// The interface font comes from the theme, so it's refreshed here when the theme or theme mode changes.
+    fn system_theme_update(
+        &mut self,
+        _keys: &[&'static str],
+        new_theme: &cosmic::cosmic_theme::Theme,
+    ) -> Task<Self::Message> {
+        let interface_font = Font::from(&new_theme.font);
+        if interface_font != self.interface_font {
+            self.interface_font = interface_font;
+            self.refresh_indicator_font();
+            self.app_text_measurements.reset();
+        }
+        Task::none()
+    }
+}
+
+impl AppState {
+    fn handle_message(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::OpenSettingsWindow(page) => {
+                self.open_settings_window(page);
+                return self.close_detail_popup();
             }
             Message::StartMonitoring => {
-                if let Some(token) = &self.monitor_cancellation_token {
-                    info!("Stopping previous monitors");
-                    token.cancel();
-                }
+                self.stop_monitoring();
 
                 info!("Starting monitoring");
 
@@ -224,180 +389,214 @@ impl Application for AppState {
                 self.monitor_cancellation_token = Some(cancellation_token.clone());
 
                 let config = self.configuration.clone();
+                let mut detail_wanted = self.detail_wanted.subscribe();
 
                 return cosmic::Task::stream(async_stream::stream! {
-                    let mut memory_update_interval = tokio::time::interval(config.memory.update_interval);
-                    let mut cpu_update_interval = tokio::time::interval(config.cpu.update_interval);
-                    let mut network_update_interval = tokio::time::interval(config.network.update_interval);
-                    let mut disk_update_interval = tokio::time::interval(config.disk.update_interval);
-
                     let mut memory_monitor = (!config.memory.hide_indicator)
                         .then(|| MemoryMonitor::new(ProcMemInfoSensorReader, &config));
-                    let mut cpuinfo_reader = (!config.cpu.hide_indicator)
-                        .then(|| CpuMonitor::new(ProcStatSensorReader, &config));
+                    let mut cpu_monitor = (!config.cpu.hide_indicator).then(|| {
+                        let topology = config.cpu.combine_cores.then(|| CpuTopology::read(Path::new(SYSFS_CPU_ROOT)));
+                        CpuMonitor::new(ProcStatSensorReader, &config, topology)
+                    });
+                    // The temperature, fan and clock speed are only shown in the cpu detail popup, so they're only
+                    // read while it's wanted. Some sensor drivers are slow to read, or wake their device to do it.
+                    let cpu_sensors_monitor = (!config.cpu.hide_indicator).then(|| {
+                        CpuSensorsMonitor::new(Path::new(HWMON_ROOT), Path::new(SYSFS_CPU_ROOT), &config.cpu)
+                    });
+                    // The network, disk and storage monitors only read what only their detail popups show, e.g. each
+                    // interface's address, each disk's mounts and the disk each mount is on, while the popup is wanted.
                     let mut network_monitor = (!config.network.hide_indicator)
-                        .then(|| NetworkMonitor::new(ProcNetDevReader, &config));
+                        .then(|| NetworkMonitor::new(ProcNetDevReader::default(), &config));
                     let mut disk_monitor = (!config.disk.hide_indicator)
-                        .then(|| DiskMonitor::new(ProcDiskStatsReader, &config));
+                        .then(|| DiskMonitor::new(
+                            ProcDiskStatsReader,
+                            ProcMountsReader,
+                            &config,
+                            Path::new(SYS_BLOCK_ROOT),
+                        ));
+                    let mut storage_monitor = (!config.storage.hide_indicator)
+                        .then(|| StorageMonitor::new(
+                            StorageReader::new(config.storage.mounts.clone()),
+                            config.storage.mounts.clone(),
+                        ));
+                    // Only the panel's gpu is read on every tick. The others are only shown in the gpu detail popup,
+                    // so they're only read while it's wanted, which leaves them free to sleep the rest of the time.
+                    let mut gpu_monitor = (!config.gpu.hide_indicator)
+                        .then(|| GpuMonitor::new(&GpuPaths::system(), &config));
+
+                    // A single scheduler drives every monitor. Monitors that fall due at (nearly) the same
+                    // time are polled together and sent as one message, because every message rebuilds and
+                    // redraws the applet. Separate timers per monitor would wake the UI once per monitor.
+                    let start = Instant::now();
+                    let mut schedules = [
+                        memory_monitor.is_some().then_some((start, config.memory.update_interval)),
+                        cpu_monitor.is_some().then_some((start, config.cpu.update_interval)),
+                        network_monitor.is_some().then_some((start, config.network.update_interval)),
+                        disk_monitor.is_some().then_some((start, config.disk.update_interval)),
+                        storage_monitor.is_some().then_some((start, config.storage.update_interval)),
+                        gpu_monitor.is_some().then_some((start, config.gpu.update_interval)),
+                    ];
 
                     loop {
+                        let Some(next_due) = schedules.iter().flatten().map(|(due, _)| *due).min() else {
+                            // Every indicator is hidden, nothing to poll.
+                            cancellation_token.cancelled().await;
+                            break;
+                        };
+
+                        // Set when a detail popup has just become wanted, to read what only it shows straight
+                        // away instead of at the next tick.
+                        let mut detail_requested = None;
+
                         tokio::select! {
-                            _ = memory_update_interval.tick(), if !config.memory.hide_indicator => {
-                                if let Some(memory_monitor) = memory_monitor.as_mut() {
-                                    yield Message::MemoryUpdate(memory_monitor.poll().unwrap_or_default());
+                            _ = tokio::time::sleep_until(next_due) => {},
+                            changed = detail_wanted.changed() => {
+                                // The sender lives as long as the applet, so this only fails as it exits.
+                                if changed.is_err() {
+                                    break;
                                 }
+                                detail_requested = *detail_wanted.borrow();
                             },
-                            _ = cpu_update_interval.tick(), if !config.cpu.hide_indicator => {
-                                if let Some(cpu_monitor) = cpuinfo_reader.as_mut() {
-                                    yield Message::CpuUpdate(cpu_monitor.poll().unwrap_or_default());
+                            _ = cancellation_token.cancelled() => break,
+                        }
+
+                        let now = Instant::now();
+                        let mut due = [false; 6];
+
+                        for (index, schedule) in schedules.iter_mut().enumerate() {
+                            if let Some((next, interval)) = schedule {
+                                if *next <= now + MONITOR_COALESCE_WINDOW {
+                                    due[index] = true;
+                                    // Scheduling from `now` keeps coalesced monitors in step and never
+                                    // leaves missed ticks to catch up on.
+                                    *next = now + *interval;
                                 }
-                            },
-                            _ = network_update_interval.tick(), if !config.network.hide_indicator => {
-                                if let Some(network_monitor) = network_monitor.as_mut() {
-                                    yield Message::NetworkUpdate(network_monitor.poll().unwrap_or_default());
-                                }
-                            },
-                            _ = disk_update_interval.tick(), if !config.disk.hide_indicator => {
-                                if let Some(disk_monitor) = disk_monitor.as_mut() {
-                                    yield Message::DiskUpdate(disk_monitor.poll().unwrap_or_default());
-                                }
-                            },
-                            _ = cancellation_token.cancelled() => {
-                                break;
                             }
                         }
 
+                        let wanted = *detail_wanted.borrow();
+                        let detailed = |kind| wanted == Some(kind);
+                        // A monitor whose popup has just become wanted is polled straight away, for what only its
+                        // popup shows. Its rates are worked out from the time that passed, so an early poll doesn't
+                        // skew them, and its schedule is left alone, so it stays in step with the others.
+                        let poll = |index: usize, kind| due[index] || detail_requested == Some(kind);
+                        let read_cpu_sensors = detail_requested == Some(IndicatorKind::Cpu)
+                            || (due[1] && detailed(IndicatorKind::Cpu));
+                        let poll_network = poll(2, IndicatorKind::Network);
+                        let poll_disk = poll(3, IndicatorKind::Disk);
+                        let poll_storage = poll(4, IndicatorKind::Storage);
+                        let poll_gpu = poll(5, IndicatorKind::Gpu);
+
+                        // Waking for a detail popup can find nothing else due, and nothing to read when it stopped
+                        // being wanted.
+                        if !read_cpu_sensors
+                            && !poll_network
+                            && !poll_disk
+                            && !poll_storage
+                            && !poll_gpu
+                            && !due.contains(&true)
+                        {
+                            continue;
+                        }
+
+                        let update = StatsUpdate {
+                            memory: memory_monitor.as_mut().filter(|_| due[0]).map(|m| m.poll().unwrap_or_default()),
+                            cpu: cpu_monitor.as_mut().filter(|_| due[1]).map(|m| m.poll().unwrap_or_default()),
+                            cpu_sensors: cpu_sensors_monitor.as_ref().filter(|_| read_cpu_sensors).map(|m| m.poll()),
+                            network: network_monitor
+                                .as_mut()
+                                .filter(|_| poll_network)
+                                .map(|m| m.poll(detailed(IndicatorKind::Network)).unwrap_or_default()),
+                            disk: disk_monitor
+                                .as_mut()
+                                .filter(|_| poll_disk)
+                                .map(|m| m.poll(detailed(IndicatorKind::Disk)).unwrap_or_default()),
+                            storage: storage_monitor
+                                .as_mut()
+                                .filter(|_| poll_storage)
+                                .map(|m| m.poll(detailed(IndicatorKind::Storage)).unwrap_or_default()),
+                            gpu: gpu_monitor.as_mut().filter(|_| poll_gpu).map(|m| m.poll(detailed(IndicatorKind::Gpu))),
+                        };
+
+                        yield Message::StatsUpdate(update);
                     }
                 })
                 .map(cosmic::Action::App);
             }
-            Message::MemoryUpdate(memory_usage) => {
-                self.memory = memory_usage;
-            }
-            Message::CpuUpdate(cpu_usage) => {
-                self.cpu = cpu_usage;
-            }
-            Message::NetworkUpdate(network_usage) => {
-                self.network = network_usage;
-            }
-            Message::DiskUpdate(disk_usage) => {
-                self.disk = disk_usage;
+            Message::StatsUpdate(update) => {
+                if let Some(memory) = update.memory {
+                    self.memory = memory;
+                }
+                if let Some(cpu) = update.cpu {
+                    self.cpu = cpu;
+                }
+                if let Some(cpu_sensors) = update.cpu_sensors {
+                    self.cpu_sensors = cpu_sensors;
+                }
+                if let Some(network) = update.network {
+                    self.network = network;
+                }
+                if let Some(disk) = update.disk {
+                    self.disk = disk;
+                }
+                if let Some(storage) = update.storage {
+                    self.storage = storage;
+                }
+                if let Some(gpu) = update.gpu {
+                    self.gpu = gpu;
+                }
             }
             Message::ConfigFileChanged(configuration) => {
-                self.configuration = configuration;
-                return cosmic::task::message(Message::StartMonitoring);
-            }
-            Message::SettingsFormUpdate(settings_form_event) => {
-                match settings_form_event {
-                    SettingsFormEvent::StringFieldUpdated(value) | SettingsFormEvent::CheckBoxUpdated(value) => {
-                        let form = self.settings_forms.get_mut(&value.settings_window_id).expect(
-                            format!("No settings form configured with key: {}", value.settings_window_id).as_str(),
-                        );
-
-                        let settings_form_item = form
-                            .values
-                            .get_mut(value.form_value_key)
-                            .expect(format!("No form row with key: {}", value.form_value_key).as_str());
-
-                        settings_form_item.value = value.value;
-                    }
+                // The configuration is reported once as the applet starts, which is the one it was started with.
+                // Restarting the monitors for it would discover the sensors and GPUs, and initialise NVML, again.
+                if configuration == self.configuration {
+                    return Task::none();
                 }
-
-                self.update_configuration();
+                self.configuration = configuration;
+                self.refresh_indicator_font();
+                // The hovered indicator may have been hidden, which leaves nothing to report that it's no longer hovered.
+                return self
+                    .close_detail_popup()
+                    .chain(cosmic::task::message(Message::StartMonitoring));
             }
-            Message::ThemeChanged(cosmic_tk) => {
-                self.active_interface_font = cosmic_tk.interface_font.clone().into();
-                self.app_text_measurements.reset();
+            Message::IndicatorHovered(kind, bounds) => {
+                let close = self.close_detail_popup();
+
+                self.hover_count += 1;
+                let hover = self.hover_count;
+                self.detail_popup = Some(DetailPopup {
+                    kind,
+                    bounds,
+                    hover,
+                    window_id: None,
+                });
+
+                let open = cosmic::task::future(async move {
+                    tokio::time::sleep(DETAIL_POPUP_DELAY).await;
+                    Message::OpenDetailPopup(hover)
+                });
+                return Task::batch([close, open]);
+            }
+            Message::IndicatorUnhovered(kind) => {
+                // Moving between indicators can report entering the next one before leaving this one.
+                if self.detail_popup.as_ref().is_some_and(|popup| popup.kind == kind) {
+                    return self.close_detail_popup();
+                }
+            }
+            Message::OpenDetailPopup(hover) => return self.open_detail_popup(hover),
+            Message::PopupClosed(id) => {
+                if self.detail_popup.as_ref().is_some_and(|popup| popup.window_id == Some(id)) {
+                    self.detail_popup = None;
+                }
             }
         }
         Task::none()
     }
 
-    fn view(&self) -> Element<'_, Self::Message> {
-        let is_horizontal = matches!(self.core.applet.anchor, PanelAnchor::Top | PanelAnchor::Bottom);
-
-        let mut elements: Vec<Element<Message>> = Vec::new();
-
-        elements.push(divider::vertical::default().into());
-
-        if let Some(element) = self.cpu.draw(&self, is_horizontal) {
-            elements.push(element);
-            elements.push(divider::vertical::default().into())
-        }
-        if let Some(element) = self.memory.draw(&self, is_horizontal) {
-            elements.push(element);
-            elements.push(divider::vertical::default().into())
-        }
-        if let Some(element) = self.network.draw(&self, is_horizontal) {
-            elements.push(element);
-            elements.push(divider::vertical::default().into())
-        }
-        if let Some(element) = self.disk.draw(&self, is_horizontal) {
-            elements.push(element);
-            elements.push(divider::vertical::default().into());
-        }
-        if elements.len() <= 1 {
-            elements.push(no_indicators_content(NoIndicatorProps {
-                icon: self.app_icons.get(APP_LOGO_ICON),
-                size: self.icon_size(),
-            }));
-            elements.push(divider::vertical::default().into());
-        }
-
-        let wrapper: Element<Message> = if is_horizontal {
-            Row::from_vec(elements)
-                .align_y(Alignment::Center)
-                .spacing(DEFAULT_INDICATOR_SPACING)
-                .into()
-        } else {
-            Column::from_vec(elements).align_x(Alignment::Center).into()
-        };
-
-        let padding = if is_horizontal {
-            [
-                self.core.applet.suggested_padding(false),
-                self.core.applet.suggested_padding(false),
-            ]
-        } else {
-            [self.core.applet.suggested_padding(false), 1]
-        };
-
-        let button = widget::button::custom(wrapper)
-            .class(cosmic::theme::Button::AppletIcon)
-            .padding(padding)
-            .on_press(Message::SettingsPopupOpened(MAIN_SETTINGS_WINDOW_ID.clone()));
-
-        autosize::autosize(container(button), AUTOSIZE_MAIN_ID.clone()).into()
-    }
-
-    fn view_window(&'_ self, _id: window::Id) -> Element<'_, Self::Message> {
-        let content_id = self.popup.unwrap_or_else(|| MAIN_SETTINGS_WINDOW_ID.clone());
-
-        let content = if content_id == MAIN_SETTINGS_WINDOW_ID.clone() {
-            MainSettingsForm::draw(self.configuration())
-        } else {
-            match self.settings_forms.get(&content_id) {
-                None => container(row!["No settings window configured."]),
-                Some(form) => form.draw(&self),
-            }
-        };
-
-        self.core.applet.popup_container(content).into()
-    }
-
-    fn style(&self) -> Option<cosmic::iced_runtime::Appearance> {
-        Some(cosmic::applet::style())
-    }
-}
-
-impl AppState {
     pub fn core(&self) -> &Core {
         &self.core
     }
 
-    pub fn app_colours(&self) -> &AppColours {
-        &self.app_colours
-    }
     pub fn app_icons(&self) -> &AppIcons {
         &self.app_icons
     }
@@ -407,98 +606,125 @@ impl AppState {
     pub fn app_text_measurements(&self) -> &AppTextMeasurements {
         &self.app_text_measurements
     }
-    pub fn active_interface_font(&self) -> &Font {
-        &self.active_interface_font
+    pub fn indicator_font(&self) -> &Font {
+        &self.indicator_font
     }
 
-    fn update_configuration(&mut self) {
-        info!("Updating configuration: {:?}", self.configuration);
-
-        let memory_settings_form = self
-            .settings_forms
-            .get(&MEMORY_SETTINGS_WINDOW_ID.clone())
-            .expect("No memory settings form configured.");
-
-        let cpu_settings_form = self
-            .settings_forms
-            .get(&CPU_SETTINGS_WINDOW_ID.clone())
-            .expect("No cpu settings form configured.");
-
-        let network_settings_form = self
-            .settings_forms
-            .get(&NETWORK_SETTINGS_WINDOW_ID.clone())
-            .expect("No network settings form configured.");
-
-        let disk_settings_form = self
-            .settings_forms
-            .get(&DISK_SETTINGS_WINDOW_ID.clone())
-            .expect("No disk settings form configured.");
-
-        let general_settings_form = self
-            .settings_forms
-            .get(&GENERAL_SETTINGS_WINDOW_ID.clone())
-            .expect("No general settings form configured.");
-
-        self.configuration = AppConfiguration {
-            general: self.configuration.general.update(general_settings_form),
-            memory: self.configuration.memory.update(memory_settings_form),
-            cpu: self.configuration.cpu.update(cpu_settings_form),
-            network: self.configuration.network.update(network_settings_form),
-            disk: self.configuration.disk.update(disk_settings_form),
-            ..Default::default()
+    fn stop_monitoring(&mut self) {
+        if let Some(token) = self.monitor_cancellation_token.take() {
+            info!("Stopping monitors");
+            token.cancel();
         }
     }
 
-    fn refresh_configuration_from_disk(&mut self) {
-        if let Ok(helper) = Config::new(Self::APP_ID, AppConfiguration::VERSION) {
-            let loaded = AppConfiguration::get_entry(&helper).unwrap_or_else(|(errs, cfg)| {
-                error!("Errors while loading configuration: {:?}", errs);
-                cfg
-            });
-
-            self.configuration = loaded;
-            self.settings_forms = self.configuration.settings_form_options();
-        } else {
-            error!("Failed to create config context for reload");
-        }
-    }
-
-    fn save_configuration(&self) {
-        info!("Saving configuration");
-
-        if let Ok(helper) = Config::new(Self::APP_ID, AppConfiguration::VERSION) {
-            if let Err(err) = self.configuration.write_entry(&helper) {
-                error!("Failed to save configuration: {}", err);
+    /// Launch the settings window as a separate process on `page`. If it's already running, ask it to show `page`.
+    fn open_settings_window(&mut self, page: SettingsPage) {
+        if let Some(child) = self.settings_process.as_mut() {
+            match child.try_wait() {
+                Ok(None) => {
+                    info!("Settings window is already open, showing the {:?} page", page);
+                    SettingsPageRequest::send(page);
+                    return;
+                }
+                // It has exited, and is now reaped. Launch a new one.
+                Ok(Some(_)) => {}
+                Err(err) => error!("Failed to check whether the settings window is open: {}", err),
             }
         }
+
+        let executable = match std::env::current_exe() {
+            Ok(executable) => executable,
+            Err(err) => {
+                error!("Failed to find the applet executable to open the settings window: {}", err);
+                return;
+            }
+        };
+
+        // The panel only passes WAYLAND_DISPLAY to applets whose desktop entry sets X-HostWaylandDisplay. Without it,
+        // the settings window can't reach the desktop compositor.
+        if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            warn!("WAYLAND_DISPLAY is not set, the settings window may fail to open");
+        }
+
+        info!("Opening settings window");
+
+        let mut command = Command::new(executable);
+        command.arg(SETTINGS_FLAG);
+        if let Some(slot) = font_size_slot(&self.core) {
+            command.arg(slot.to_arg());
+        }
+        command.arg(page.to_arg());
+
+        // The privileged socket belongs to the applet, the settings window has no use for it. The applet's limit on
+        // its async runtime's threads is set for the applet alone.
+        command
+            .env_remove("X_PRIVILEGED_WAYLAND_SOCKET")
+            .env_remove(crate::TOKIO_WORKER_THREADS)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        match command.spawn() {
+            Ok(child) => self.settings_process = Some(child),
+            Err(err) => error!("Failed to open the settings window: {}", err),
+        }
+    }
+
+    /// Open the detail popup for the hovered indicator, if it is still the hover that asked for it.
+    fn open_detail_popup(&mut self, hover: u64) -> Task<Message> {
+        let Some(parent) = self.core.main_window_id() else {
+            return Task::none();
+        };
+        let Some(popup) = self.detail_popup.as_mut().filter(|popup| popup.hover == hover) else {
+            return Task::none();
+        };
+        if popup.window_id.is_some() {
+            return Task::none();
+        }
+
+        let id = window::Id::unique();
+        popup.window_id = Some(id);
+        get_popup(detail_popup_settings(&self.core, parent, id, popup.bounds))
+    }
+
+    /// A detail popup is wanted from when its indicator is hovered, so what only it shows has been read by the time it
+    /// opens, until it closes.
+    fn sync_detail_wanted(&self) {
+        let wanted = self.detail_popup.as_ref().map(|popup| popup.kind);
+        self.detail_wanted.send_if_modified(|current| {
+            let changed = *current != wanted;
+            *current = wanted;
+            changed
+        });
+    }
+
+    fn close_detail_popup(&mut self) -> Task<Message> {
+        match self.detail_popup.take().and_then(|popup| popup.window_id) {
+            Some(id) => destroy_popup(id),
+            None => Task::none(),
+        }
+    }
+
+    fn detail_popup_content(&self, kind: IndicatorKind) -> Option<Element<'_, Message>> {
+        let style = PopupStyle::new(self.indicator_font);
+        let (configuration, app_icons) = (&self.configuration, &self.app_icons);
+        match kind {
+            IndicatorKind::Cpu => Some(self.cpu.detail(&self.cpu_info, &self.cpu_sensors, configuration, app_icons, style)),
+            IndicatorKind::Memory => Some(self.memory.detail(configuration, app_icons, style)),
+            IndicatorKind::Gpu => Some(self.gpu.detail(configuration, app_icons, style)),
+            IndicatorKind::Network => Some(self.network.detail(configuration, app_icons, style)),
+            IndicatorKind::Disk => Some(self.disk.detail(configuration, app_icons, style)),
+            IndicatorKind::Storage => Some(self.storage.detail(configuration, app_icons, style)),
+        }
+    }
+
+    fn refresh_indicator_font(&mut self) {
+        self.indicator_font = app_fonts::resolve_font(&self.configuration.general.font, &self.interface_font);
     }
 
     pub fn font_size(&self, horizontal: bool) -> u16 {
-        let configuration = self.configuration();
-
-        match self.core.applet.size {
-            cosmic::applet::Size::PanelSize(PanelSize::XS) if horizontal => {
-                configuration.general.horizontal_font_size_xs
-            }
-            cosmic::applet::Size::PanelSize(PanelSize::XS) => configuration.general.vertical_font_size_xs,
-            cosmic::applet::Size::PanelSize(PanelSize::S) if horizontal => {
-                configuration.general.horizontal_font_size_sm
-            }
-            cosmic::applet::Size::PanelSize(PanelSize::S) => configuration.general.vertical_font_size_sm,
-            cosmic::applet::Size::PanelSize(PanelSize::M) if horizontal => {
-                configuration.general.horizontal_font_size_md
-            }
-            cosmic::applet::Size::PanelSize(PanelSize::M) => configuration.general.vertical_font_size_md,
-            cosmic::applet::Size::PanelSize(PanelSize::L) if horizontal => {
-                configuration.general.horizontal_font_size_lg
-            }
-            cosmic::applet::Size::PanelSize(PanelSize::L) => configuration.general.vertical_font_size_lg,
-            cosmic::applet::Size::PanelSize(PanelSize::XL) if horizontal => {
-                configuration.general.horizontal_font_size_xl
-            }
-            cosmic::applet::Size::PanelSize(PanelSize::XL) => configuration.general.vertical_font_size_xl,
-            _ => DEFAULT_INDICATOR_FONT_SIZE,
-        }
+        FontSizeSlot::from_applet_size(&self.core.applet.size, horizontal)
+            .map_or(DEFAULT_INDICATOR_FONT_SIZE, |slot| self.configuration.general.font_size(slot))
     }
 
     pub fn icon_size(&self) -> u16 {
@@ -511,4 +737,35 @@ impl AppState {
             _ => DEFAULT_INDICATOR_ICON_SIZE,
         }
     }
+}
+
+fn is_horizontal(core: &Core) -> bool {
+    matches!(core.applet.anchor, PanelAnchor::Top | PanelAnchor::Bottom)
+}
+
+/// A popup anchored to the indicator with `bounds`, beyond the panel's edge, which doesn't take the pointer or
+/// keyboard, so the indicator stays hovered and the panel keeps working while it's open.
+fn detail_popup_settings(core: &Core, parent: window::Id, id: window::Id, bounds: Rectangle) -> SctkPopupSettings {
+    let mut settings = core.applet.get_popup_settings(parent, id, None, None, None);
+
+    // The default anchor spans the whole applet. Narrow it to the indicator along the panel, and keep the applet's
+    // thickness across it so the popup clears the panel.
+    let anchor = &mut settings.positioner.anchor_rect;
+    if is_horizontal(core) {
+        anchor.x = bounds.x.round() as i32;
+        anchor.width = bounds.width.round() as i32;
+    } else {
+        anchor.y = bounds.y.round() as i32;
+        anchor.height = bounds.height.round() as i32;
+    }
+
+    settings.grab = false;
+    // An empty input region, placed off the surface as the COSMIC applet tooltips do, so the pointer passes through.
+    settings.input_zone = Some(vec![Rectangle::new(Point::new(-1000.0, -1000.0), Size::default())]);
+    settings
+}
+
+/// The font size slot for the panel/dock the applet is running in, which is the one the settings form edits.
+fn font_size_slot(core: &Core) -> Option<FontSizeSlot> {
+    FontSizeSlot::from_applet_size(&core.applet.size, is_horizontal(core))
 }

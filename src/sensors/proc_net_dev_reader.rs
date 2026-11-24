@@ -1,8 +1,9 @@
-use crate::sensors::network_utilities::is_physical_interface;
+use crate::sensors::network_utilities::{ipv4_addresses, is_interface_up, is_physical_interface};
 use crate::sensors::sensor_traits::SensorReader;
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use crate::sensors::proc_file;
+use std::net::Ipv4Addr;
 
 const PROC_NET_DEV_FILE: &str = "/proc/net/dev";
 const PROC_NET_DEV_DEVICE_NAME_INDEX: usize = 0;
@@ -20,11 +21,16 @@ impl ProcNetDevStatus {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ProcNetDevDeviceStatus {
+    pub name: String,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
     pub is_physical_device: bool,
+    /// Whether the link is up. Only read for physical devices, by a detailed read.
+    pub is_up: bool,
+    /// The device's IPv4 address, if it has one. Only read for physical devices, by a detailed read.
+    pub ipv4: Option<Ipv4Addr>,
 }
 
 struct ProcNetDevLine {
@@ -33,52 +39,73 @@ struct ProcNetDevLine {
     tx_bytes: u64,
 }
 
-impl ProcNetDevDeviceStatus {
-    pub fn new(rx_bytes: u64, tx_bytes: u64, is_physical_device: bool) -> Self {
-        Self {
-            rx_bytes,
-            tx_bytes,
-            is_physical_device,
-        }
-    }
+/// Reads the totals of every network device. The link state and address of each physical one are only shown in the
+/// detail popup, and looking up the addresses asks the kernel for every address of every device, so they're only read
+/// by a detailed read.
+#[derive(Default)]
+pub struct ProcNetDevReader {
+    /// Whether each device is physical, by name, which only changes if the device goes and another takes its name.
+    is_physical: RefCell<HashMap<String, bool>>,
 }
-
-pub struct ProcNetDevReader;
 
 impl SensorReader for ProcNetDevReader {
     type Output = ProcNetDevStatus;
 
     fn read(&self) -> Result<Self::Output, String> {
-        let path = Path::new(PROC_NET_DEV_FILE);
+        self.read_with(false)
+    }
 
-        let mut file = match File::open(path) {
-            Ok(file) => file,
-            Err(e) => return Err(format!("Unable to open file: {} {}", PROC_NET_DEV_FILE, e)),
-        };
-
-        let mut contents = String::new();
-
-        if let Err(_) = file.read_to_string(&mut contents) {
-            return Err(format!("Unable to read {}", PROC_NET_DEV_FILE));
-        }
-
-        let mut statuses = Vec::new();
-
-        for line in contents.lines().skip(2) {
-            let device_status = self.parse_proc_file_line(line)?;
-
-            statuses.push(ProcNetDevDeviceStatus::new(
-                device_status.rx_bytes,
-                device_status.tx_bytes,
-                is_physical_interface(device_status.device_name.as_str()),
-            ));
-        }
-
-        Ok(ProcNetDevStatus::new(statuses))
+    fn read_detailed(&self) -> Result<Self::Output, String> {
+        self.read_with(true)
     }
 }
 
 impl ProcNetDevReader {
+    fn read_with(&self, detailed: bool) -> Result<ProcNetDevStatus, String> {
+        let lines = proc_file::read(PROC_NET_DEV_FILE, |contents| {
+            contents
+                .lines()
+                .skip(2)
+                .map(|line| self.parse_proc_file_line(line))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|e| format!("Unable to read {}: {}", PROC_NET_DEV_FILE, e))??;
+
+        let mut statuses = Vec::new();
+        let mut addresses = None;
+        let mut known = self.is_physical.borrow_mut();
+        let mut is_physical = HashMap::with_capacity(known.len());
+
+        for line in lines {
+            let is_physical_device = known
+                .remove(&line.device_name)
+                .unwrap_or_else(|| is_physical_interface(&line.device_name));
+            is_physical.insert(line.device_name.clone(), is_physical_device);
+
+            let (is_up, ipv4) = if detailed && is_physical_device {
+                // Only looked up once there's a physical device to look it up for.
+                let addresses = addresses.get_or_insert_with(ipv4_addresses);
+                (is_interface_up(&line.device_name), addresses.get(&line.device_name).copied())
+            } else {
+                (false, None)
+            };
+
+            statuses.push(ProcNetDevDeviceStatus {
+                name: line.device_name,
+                rx_bytes: line.rx_bytes,
+                tx_bytes: line.tx_bytes,
+                is_physical_device,
+                is_up,
+                ipv4,
+            });
+        }
+
+        // Devices that have gone are forgotten, so a device that takes one's name is checked afresh.
+        *known = is_physical;
+
+        Ok(ProcNetDevStatus::new(statuses))
+    }
+
     fn parse_proc_file_line(&self, line: &str) -> Result<ProcNetDevLine, String> {
         let parts: Vec<&str> = line.split_whitespace().collect();
 

@@ -1,113 +1,97 @@
-use crate::app::{AppState, Message};
+use crate::app::Message;
 use crate::configuration::app_configuration::AppConfiguration;
-use crate::monitors::network_monitor::NetworkStats;
-use crate::core::app_colours::{ACCENT_GREEN, ACCENT_RED};
-use crate::core::app_icons::{DOWN_ARROW_ICON, UP_ARROW_ICON};
-use crate::ui::components::indicator::{indicator, IndicatorProps, IndicatorValueItem};
-use crate::ui::components::svg_icon::SvgIconProps;
-use cosmic::iced::Color;
+use crate::core::app_icons::{AppIcons, DOWN_ARROW_ICON, UP_ARROW_ICON};
+use crate::fl;
+use crate::monitors::network_monitor::{InterfaceStats, NetworkStats};
+use crate::ui::components::detail_popup::{card, detail_popup, heading_row, popup_header, PopupStyle, ROW_SPACING};
+use crate::ui::components::indicator::IndicatorContent;
+use crate::ui::indicators::{data_rate_content, detail_rates, DataRate};
+use cosmic::iced::widget::Column;
 use cosmic::Element;
-use crate::ui::indicators::format_bytes_per_second;
 
 impl NetworkStats {
-    pub fn draw<'app>(&self, app_state: &'app AppState, horizontal: bool) -> Option<Element<'app, Message>> {
-        let core = app_state.core();
-        let configuration = app_state.configuration();
-
-        if self.is_hidden(configuration) {
+    pub fn content(&self, configuration: &AppConfiguration) -> Option<IndicatorContent> {
+        let network = &configuration.network;
+        if network.hide_indicator {
             return None;
         }
 
-        let text = if configuration.network.hide_label { None } else { configuration.network.label_text.clone() };
+        Some(data_rate_content(configuration, rates(configuration, self.rx_bytes, self.tx_bytes)))
+    }
 
-        let display_item_color = self.label_colour(app_state);
-        let font_size = app_state.font_size(horizontal);
-        let icon_size = app_state.icon_size();
-
-        let max_text_width = if configuration.general.fix_indicator_size {
-            app_state
-                .app_text_measurements()
-                .measure(self.max_label_text(configuration), font_size)
+    /// The popup shown when hovering over the indicator, which breaks its totals down by interface.
+    pub fn detail<'a>(
+        &'a self,
+        configuration: &'a AppConfiguration,
+        app_icons: &'a AppIcons,
+        style: PopupStyle,
+    ) -> Element<'a, Message> {
+        let cards: Vec<Element<'a, Message>> = if self.interfaces.is_empty() {
+            vec![card(style.caption(fl!("popup-network-none")))]
         } else {
-            None
+            self.interfaces
+                .iter()
+                .map(|interface| card(interface_detail(style, interface, configuration, app_icons)))
+                .collect()
         };
 
-        let mut values: Vec<IndicatorValueItem> = Vec::new();
-        values.push(IndicatorValueItem {
-            text: self.read_value(app_state.configuration()),
-            icon: if horizontal {
-                Some(SvgIconProps {
-                    icon: app_state.app_icons().get(DOWN_ARROW_ICON),
-                    size: icon_size,
-                    colour: app_state
-                        .app_colours()
-                        .get(ACCENT_GREEN)
-                        .map(|c| Color::new(c.red, c.green, c.blue, c.alpha)),
-                })
-            } else {
-                None
-            },
-        });
+        let totals = detail_rates(
+            style,
+            configuration,
+            app_icons,
+            rates(configuration, self.rx_bytes, self.tx_bytes),
+            true,
+        );
+        let header = popup_header(style, None, None, fl!("popup-network-title"), Some(totals));
 
-        values.push(IndicatorValueItem {
-            text: self.write_value(app_state.configuration()),
-            icon: if horizontal {
-                Some(SvgIconProps {
-                    icon: app_state.app_icons().get(UP_ARROW_ICON),
-                    size: icon_size,
-                    colour: app_state
-                        .app_colours()
-                        .get(ACCENT_RED)
-                        .map(|c| Color::new(c.red, c.green, c.blue, c.alpha)),
-                })
-            } else {
-                None
-            },
-        });
+        detail_popup(header, cards)
+    }
+}
 
-        indicator(
-            core,
-            IndicatorProps {
-                label_text: text,
-                label_colour: display_item_color,
-                font_size,
-                font: app_state.active_interface_font(),
-                value_width: max_text_width,
-                horizontal,
-                spacing: app_state.core().applet.suggested_padding(true),
-                icon_spacing: 2,
-                values,
-            },
+/// The download and upload rates, in the configured colours.
+fn rates(configuration: &AppConfiguration, rx_bytes: u64, tx_bytes: u64) -> [DataRate<'_>; 2] {
+    let network = &configuration.network;
+    [
+        DataRate {
+            icon_key: DOWN_ARROW_ICON,
+            colour: network.download_colour.as_deref(),
+            bytes_per_second: rx_bytes,
+        },
+        DataRate {
+            icon_key: UP_ARROW_ICON,
+            colour: network.upload_colour.as_deref(),
+            bytes_per_second: tx_bytes,
+        },
+    ]
+}
+
+/// The interface's name and IPv4 address, above its download and upload rates. A disconnected interface only says
+/// that it's disconnected.
+fn interface_detail<'a>(
+    style: PopupStyle,
+    interface: &'a InterfaceStats,
+    configuration: &'a AppConfiguration,
+    app_icons: &'a AppIcons,
+) -> Element<'a, Message> {
+    let caption = if interface.is_up {
+        interface.ipv4.map(|address| address.to_string())
+    } else {
+        Some(fl!("popup-network-disconnected"))
+    };
+
+    let rates = interface.is_up.then(|| {
+        detail_rates(
+            style,
+            configuration,
+            app_icons,
+            rates(configuration, interface.rx_bytes, interface.tx_bytes),
+            false,
         )
-    }
-    
-    fn label_colour(&self, app_state: &AppState) -> Color {
-        app_state
-            .configuration()
-            .network
-            .label_colour
-            .as_deref()
-            .and_then(|key| app_state.app_colours().get(key))
-            .map_or(Color::WHITE, |c| Color::new(c.red, c.green, c.blue, c.alpha))
-    }
+    });
 
-    fn read_value(&self, app_config: &AppConfiguration) -> String {
-        format_bytes_per_second(self.rx_bytes, app_config)
-    }
-
-    fn write_value(&self, app_config: &AppConfiguration) -> String {
-        format_bytes_per_second(self.tx_bytes, app_config)
-    }
-
-    fn max_label_text(&self, app_config: &AppConfiguration) -> &'static str {
-        if app_config.general.use_iec_units {
-            "99.9MiB/s"
-        } else {
-            "99.9MB/s"
-        }
-    }
-
-    fn is_hidden(&self, app_config: &AppConfiguration) -> bool {
-        app_config.network.hide_indicator
-    }
+    Column::new()
+        .spacing(ROW_SPACING)
+        .push(heading_row(style, interface.name.as_str(), caption))
+        .push_maybe(rates)
+        .into()
 }

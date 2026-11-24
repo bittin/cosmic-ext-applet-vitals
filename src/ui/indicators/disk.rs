@@ -1,113 +1,116 @@
-use crate::app::{AppState, Message};
+use crate::app::Message;
 use crate::configuration::app_configuration::AppConfiguration;
-use crate::monitors::disk_monitor::DiskStats;
-use crate::core::app_colours::{ACCENT_GREEN, ACCENT_RED};
-use crate::core::app_icons::{READ_ICON, WRITE_ICON};
-use crate::ui::components::indicator::{indicator, IndicatorProps, IndicatorValueItem};
-use crate::ui::components::svg_icon::SvgIconProps;
-use cosmic::iced::Color;
+use crate::core::app_icons::{AppIcons, READ_ICON, WRITE_ICON};
+use crate::fl;
+use crate::monitors::disk_monitor::{DiskDeviceStats, DiskStats};
+use crate::ui::components::detail_popup::{
+    card, detail_popup, heading_row, inline_bar, popup_header, PopupStyle, ROW_SPACING,
+};
+use crate::ui::components::indicator::IndicatorContent;
+use crate::ui::indicators::{data_rate_content, detail_rates, DataRate};
+use cosmic::iced::widget::Column;
 use cosmic::Element;
-use crate::ui::indicators::format_bytes_per_second;
+
+/// The width of the "BUSY" label before each disk's busy bar.
+const BUSY_LABEL_WIDTH: f32 = 34.0;
 
 impl DiskStats {
-    pub fn draw<'app>(&self, app_state: &'app AppState, horizontal: bool) -> Option<Element<'app, Message>> {
-        let core = app_state.core();
-        let configuration = app_state.configuration();
-
-        if self.is_hidden(configuration) {
+    pub fn content(&self, configuration: &AppConfiguration) -> Option<IndicatorContent> {
+        let disk = &configuration.disk;
+        if disk.hide_indicator {
             return None;
         }
 
-        let text = if configuration.disk.hide_label { None } else { configuration.disk.label_text.clone() };
+        Some(data_rate_content(
+            configuration,
+            rates(configuration, self.avg_bytes_read, self.avg_bytes_written),
+        ))
+    }
 
-        let display_item_color = self.label_colour(app_state);
-        let font_size = app_state.font_size(horizontal);
-        let icon_size = app_state.icon_size();
-
-        let max_text_width = if configuration.general.fix_indicator_size {
-            app_state
-                .app_text_measurements()
-                .measure(self.max_label_text(configuration), font_size)
+    /// The popup shown when hovering over the indicator, which breaks its totals down by disk.
+    pub fn detail<'a>(
+        &'a self,
+        configuration: &'a AppConfiguration,
+        app_icons: &'a AppIcons,
+        style: PopupStyle,
+    ) -> Element<'a, Message> {
+        let cards: Vec<Element<'a, Message>> = if self.devices.is_empty() {
+            vec![card(style.caption(fl!("popup-disk-none")))]
         } else {
-            None
+            self.devices
+                .iter()
+                .map(|device| card(device_detail(style, device, configuration, app_icons)))
+                .collect()
         };
 
-        let mut values: Vec<IndicatorValueItem> = Vec::new();
-        values.push(IndicatorValueItem {
-            text: self.read_value(app_state.configuration()),
-            icon: if horizontal {
-                Some(SvgIconProps {
-                    icon: app_state.app_icons().get(READ_ICON),
-                    size: icon_size,
-                    colour: app_state
-                        .app_colours()
-                        .get(ACCENT_GREEN)
-                        .map(|c| Color::new(c.red, c.green, c.blue, c.alpha)),
-                })
-            } else {
-                None
-            },
-        });
+        let totals = detail_rates(
+            style,
+            configuration,
+            app_icons,
+            rates(configuration, self.avg_bytes_read, self.avg_bytes_written),
+            true,
+        );
+        let header = popup_header(style, None, None, fl!("popup-disk-title"), Some(totals));
 
-        values.push(IndicatorValueItem {
-            text: self.write_value(app_state.configuration()),
-            icon: if horizontal {
-                Some(SvgIconProps {
-                    icon: app_state.app_icons().get(WRITE_ICON),
-                    size: icon_size,
-                    colour: app_state
-                        .app_colours()
-                        .get(ACCENT_RED)
-                        .map(|c| Color::new(c.red, c.green, c.blue, c.alpha)),
-                })
-            } else {
-                None
-            },
-        });
+        detail_popup(header, cards)
+    }
+}
 
-        indicator(
-            core,
-            IndicatorProps {
-                label_text: text,
-                label_colour: display_item_color,
-                font_size,
-                font: app_state.active_interface_font(),
-                value_width: max_text_width,
-                horizontal,
-                spacing: app_state.core().applet.suggested_padding(true),
-                icon_spacing: 2,
-                values,
-            },
-        )
-    }
-    
-    fn label_colour(&self, app_state: &AppState) -> Color {
-        app_state
-            .configuration()
-            .disk
-            .label_colour
-            .as_deref()
-            .and_then(|key| app_state.app_colours().get(key))
-            .map_or(Color::WHITE, |c| Color::new(c.red, c.green, c.blue, c.alpha))
-    }
+/// The read and write rates, in the configured colours.
+fn rates(configuration: &AppConfiguration, bytes_read: u64, bytes_written: u64) -> [DataRate<'_>; 2] {
+    let disk = &configuration.disk;
+    [
+        DataRate {
+            icon_key: READ_ICON,
+            colour: disk.read_colour.as_deref(),
+            bytes_per_second: bytes_read,
+        },
+        DataRate {
+            icon_key: WRITE_ICON,
+            colour: disk.write_colour.as_deref(),
+            bytes_per_second: bytes_written,
+        },
+    ]
+}
 
-    fn read_value(&self, app_config: &AppConfiguration) -> String {
-        format_bytes_per_second(self.avg_bytes_read, app_config)
-    }
+/// The disk's name and model, and whether it's mounted, above its read and write rates and how busy it is.
+fn device_detail<'a>(
+    style: PopupStyle,
+    device: &'a DiskDeviceStats,
+    configuration: &'a AppConfiguration,
+    app_icons: &'a AppIcons,
+) -> Element<'a, Message> {
+    let caption = match (device.model.as_deref(), device.is_mounted) {
+        (model, true) => model.map(str::to_string),
+        (None, false) => Some(fl!("popup-disk-unmounted")),
+        (Some(model), false) => Some(format!("{model} · {}", fl!("popup-disk-unmounted"))),
+    };
 
-    fn write_value(&self, app_config: &AppConfiguration) -> String {
-        format_bytes_per_second(self.avg_bytes_written, app_config)
-    }
+    let rates = detail_rates(
+        style,
+        configuration,
+        app_icons,
+        rates(configuration, device.bytes_read, device.bytes_written),
+        false,
+    );
 
-    fn max_label_text(&self, app_config: &AppConfiguration) -> &'static str {
-        if app_config.general.use_iec_units {
-            "99.9MiB/s"
-        } else {
-            "99.9MB/s"
-        }
-    }
+    Column::new()
+        .spacing(ROW_SPACING)
+        .push(heading_row(style, device.name.as_str(), caption))
+        .push(rates)
+        .push(busy_bar(style, device.busy_percent))
+        .into()
+}
 
-    fn is_hidden(&self, app_config: &AppConfiguration) -> bool {
-        app_config.disk.hide_indicator
-    }
+/// How busy the disk is, as a bar and a percentage. A disk can be fully busy at a low data rate, e.g. with many small
+/// reads, so this shows when it's the bottleneck.
+fn busy_bar<'a>(style: PopupStyle, busy_percent: f64) -> Element<'a, Message> {
+    inline_bar(
+        style,
+        style.section_heading(fl!("popup-disk-busy")),
+        BUSY_LABEL_WIDTH,
+        Some(busy_percent),
+        (busy_percent.clamp(0.0, 100.0) / 100.0) as f32,
+        None,
+    )
 }

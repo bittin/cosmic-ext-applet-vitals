@@ -1,10 +1,113 @@
+use cosmic::applet::cosmic_panel_config::PanelSize;
 use serde::{Deserialize, Serialize};
 
-use crate::configuration::app_configuration::{GENERAL_SETTINGS_WINDOW_ID, FIX_INDICATOR_SIZE_SETTING_KEY, USE_IEC_UNITS_SETTING_KEY};
+use crate::configuration::app_configuration::{
+    FIX_INDICATOR_SIZE_SETTING_KEY, FONT_SETTING_KEY, FONT_SIZE_SETTING_KEY,
+    GENERAL_SETTINGS_WINDOW_ID, SHOW_INDICATOR_SEPARATORS_SETTING_KEY, USE_IEC_UNITS_SETTING_KEY,
+};
 use crate::configuration::validation::ConfigurationValidation;
 use crate::core::settings::SettingsForm;
 
 const DEFAULT_INDICATOR_FONT_SIZE: u16 = 14;
+pub const INDICATOR_FONT_SIZE_MINIMUM: u16 = 6;
+pub const INDICATOR_FONT_SIZE_MAXIMUM: u16 = 48;
+
+const FONT_FORM_VALUE_SYSTEM: &str = "system";
+const FONT_FORM_VALUE_FAMILY_PREFIX: &str = "family:";
+
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum IndicatorFont {
+    /// The COSMIC interface font
+    #[default]
+    System,
+    Family(String),
+}
+
+impl IndicatorFont {
+    /// Family names are prefixed so a font called "system" can't clash with that option.
+    pub fn to_form_value(&self) -> String {
+        match self {
+            IndicatorFont::System => FONT_FORM_VALUE_SYSTEM.to_string(),
+            IndicatorFont::Family(family) => format!("{FONT_FORM_VALUE_FAMILY_PREFIX}{family}"),
+        }
+    }
+
+    pub fn from_form_value(value: &str) -> Option<Self> {
+        match value {
+            FONT_FORM_VALUE_SYSTEM => Some(IndicatorFont::System),
+            _ => value
+                .strip_prefix(FONT_FORM_VALUE_FAMILY_PREFIX)
+                .map(str::trim)
+                .filter(|family| !family.is_empty())
+                .map(|family| IndicatorFont::Family(family.to_string())),
+        }
+    }
+}
+
+/// The named panel/dock sizes, each of which has its own configured font size.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PanelSizeName {
+    XS,
+    S,
+    M,
+    L,
+    XL,
+}
+
+impl PanelSizeName {
+    pub fn label(&self) -> &'static str {
+        match self {
+            PanelSizeName::XS => "XS",
+            PanelSizeName::S => "S",
+            PanelSizeName::M => "M",
+            PanelSizeName::L => "L",
+            PanelSizeName::XL => "XL",
+        }
+    }
+}
+
+/// Identifies which of the configured font sizes applies to the panel/dock the applet is running in.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct FontSizeSlot {
+    pub horizontal: bool,
+    pub size: PanelSizeName,
+}
+
+impl FontSizeSlot {
+    /// Custom and hardcoded sizes have no configured font size, so they have no slot.
+    pub fn from_applet_size(size: &cosmic::applet::Size, horizontal: bool) -> Option<Self> {
+        let size = match size {
+            cosmic::applet::Size::PanelSize(PanelSize::XS) => PanelSizeName::XS,
+            cosmic::applet::Size::PanelSize(PanelSize::S) => PanelSizeName::S,
+            cosmic::applet::Size::PanelSize(PanelSize::M) => PanelSizeName::M,
+            cosmic::applet::Size::PanelSize(PanelSize::L) => PanelSizeName::L,
+            cosmic::applet::Size::PanelSize(PanelSize::XL) => PanelSizeName::XL,
+            _ => return None,
+        };
+
+        Some(FontSizeSlot { horizontal, size })
+    }
+
+    /// The command line argument that passes this slot to the settings window, e.g. `horizontal-M`.
+    pub fn to_arg(&self) -> String {
+        let orientation = if self.horizontal { "horizontal" } else { "vertical" };
+        format!("{orientation}-{}", self.size.label())
+    }
+
+    pub fn from_arg(arg: &str) -> Option<Self> {
+        let (orientation, size) = arg.split_once('-')?;
+        let horizontal = match orientation {
+            "horizontal" => true,
+            "vertical" => false,
+            _ => return None,
+        };
+        let size = [PanelSizeName::XS, PanelSizeName::S, PanelSizeName::M, PanelSizeName::L, PanelSizeName::XL]
+            .into_iter()
+            .find(|name| name.label() == size)?;
+
+        Some(FontSizeSlot { horizontal, size })
+    }
+}
 
 /// General configuration for the app, i.e. font size.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -25,6 +128,9 @@ pub struct GeneralConfiguration {
     pub fix_indicator_size: bool,
     /// When true, use IEC units (MiB, GiB); when false, use SI (MB, GB).
     pub use_iec_units: bool,
+    /// When true, separators are drawn between (and either side of) the indicators.
+    pub show_indicator_separators: bool,
+    pub font: IndicatorFont,
 }
 
 impl Default for GeneralConfiguration {
@@ -42,17 +148,50 @@ impl Default for GeneralConfiguration {
             horizontal_font_size_xl: DEFAULT_INDICATOR_FONT_SIZE + 8,
             fix_indicator_size: true,
             use_iec_units: false,
+            show_indicator_separators: true,
+            font: IndicatorFont::System,
         }
     }
 }
 
 impl GeneralConfiguration {
-    pub fn update(&self, settings_form: &SettingsForm) -> Self {
+    pub fn font_size(&self, slot: FontSizeSlot) -> u16 {
+        match (slot.horizontal, slot.size) {
+            (true, PanelSizeName::XS) => self.horizontal_font_size_xs,
+            (true, PanelSizeName::S) => self.horizontal_font_size_sm,
+            (true, PanelSizeName::M) => self.horizontal_font_size_md,
+            (true, PanelSizeName::L) => self.horizontal_font_size_lg,
+            (true, PanelSizeName::XL) => self.horizontal_font_size_xl,
+            (false, PanelSizeName::XS) => self.vertical_font_size_xs,
+            (false, PanelSizeName::S) => self.vertical_font_size_sm,
+            (false, PanelSizeName::M) => self.vertical_font_size_md,
+            (false, PanelSizeName::L) => self.vertical_font_size_lg,
+            (false, PanelSizeName::XL) => self.vertical_font_size_xl,
+        }
+    }
+
+    fn font_size_mut(&mut self, slot: FontSizeSlot) -> &mut u16 {
+        match (slot.horizontal, slot.size) {
+            (true, PanelSizeName::XS) => &mut self.horizontal_font_size_xs,
+            (true, PanelSizeName::S) => &mut self.horizontal_font_size_sm,
+            (true, PanelSizeName::M) => &mut self.horizontal_font_size_md,
+            (true, PanelSizeName::L) => &mut self.horizontal_font_size_lg,
+            (true, PanelSizeName::XL) => &mut self.horizontal_font_size_xl,
+            (false, PanelSizeName::XS) => &mut self.vertical_font_size_xs,
+            (false, PanelSizeName::S) => &mut self.vertical_font_size_sm,
+            (false, PanelSizeName::M) => &mut self.vertical_font_size_md,
+            (false, PanelSizeName::L) => &mut self.vertical_font_size_lg,
+            (false, PanelSizeName::XL) => &mut self.vertical_font_size_xl,
+        }
+    }
+
+    /// Only the font size for `font_size_slot` is editable, as the form only shows the current panel/dock size.
+    pub fn update(&self, settings_form: &SettingsForm, font_size_slot: Option<FontSizeSlot>) -> Self {
         if settings_form.settings_window_id != GENERAL_SETTINGS_WINDOW_ID.clone() {
             panic!("Attempted to update General settings from a non-general settings window.")
         }
 
-        GeneralConfiguration {
+        let mut configuration = GeneralConfiguration {
             fix_indicator_size: ConfigurationValidation::sanitise_boolean_input(
                 settings_form
                     .values
@@ -71,7 +210,133 @@ impl GeneralConfiguration {
                     .clone(),
                 self.use_iec_units,
             ),
+            show_indicator_separators: ConfigurationValidation::sanitise_boolean_input(
+                settings_form
+                    .values
+                    .get(SHOW_INDICATOR_SEPARATORS_SETTING_KEY)
+                    .expect("Show indicator separators missing from settings form options")
+                    .value
+                    .clone(),
+                self.show_indicator_separators,
+            ),
+            font: settings_form
+                .values
+                .get(FONT_SETTING_KEY)
+                .and_then(|item| IndicatorFont::from_form_value(&item.value))
+                .unwrap_or_else(|| self.font.clone()),
             ..self.clone()
+        };
+
+        if let Some(slot) = font_size_slot {
+            if let Some(item) = settings_form.values.get(FONT_SIZE_SETTING_KEY) {
+                let font_size = configuration.font_size_mut(slot);
+                *font_size = ConfigurationValidation::sanitise_font_size(&item.value, *font_size);
+            }
         }
+
+        configuration
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FontSizeSlot, GeneralConfiguration, IndicatorFont, PanelSizeName};
+
+    #[test]
+    fn font_size_slot_round_trips_through_arg() {
+        for horizontal in [true, false] {
+            for size in [PanelSizeName::XS, PanelSizeName::S, PanelSizeName::M, PanelSizeName::L, PanelSizeName::XL] {
+                let slot = FontSizeSlot { horizontal, size };
+                assert_eq!(FontSizeSlot::from_arg(&slot.to_arg()), Some(slot));
+            }
+        }
+
+        assert_eq!(FontSizeSlot::from_arg("horizontal-XXL"), None);
+        assert_eq!(FontSizeSlot::from_arg("diagonal-M"), None);
+        assert_eq!(FontSizeSlot::from_arg(""), None);
+    }
+    use crate::configuration::app_configuration::FONT_SIZE_SETTING_KEY;
+    use crate::core::settings::SettingsForm;
+    use cosmic::applet::cosmic_panel_config::PanelSize;
+
+    #[test]
+    fn named_panel_sizes_have_a_font_size_slot() {
+        let slot = FontSizeSlot::from_applet_size(&cosmic::applet::Size::PanelSize(PanelSize::XL), true);
+        assert_eq!(
+            slot,
+            Some(FontSizeSlot {
+                horizontal: true,
+                size: PanelSizeName::XL
+            })
+        );
+    }
+
+    #[test]
+    fn custom_panel_sizes_have_no_font_size_slot() {
+        assert_eq!(
+            FontSizeSlot::from_applet_size(&cosmic::applet::Size::PanelSize(PanelSize::Custom(40)), true),
+            None
+        );
+        assert_eq!(
+            FontSizeSlot::from_applet_size(&cosmic::applet::Size::Hardcoded((10, 10)), false),
+            None
+        );
+    }
+
+    #[test]
+    fn font_size_field_is_hidden_without_a_slot() {
+        let form = SettingsForm::from_general(&GeneralConfiguration::default(), None);
+        assert!(form.values.get(FONT_SIZE_SETTING_KEY).is_none());
+    }
+
+    #[test]
+    fn update_only_changes_the_font_size_for_the_current_slot() {
+        let slot = FontSizeSlot {
+            horizontal: false,
+            size: PanelSizeName::L,
+        };
+        let configuration = GeneralConfiguration::default();
+        let mut form = SettingsForm::from_general(&configuration, Some(slot));
+
+        let item = form.values.get_mut(FONT_SIZE_SETTING_KEY).expect("Font size missing from form");
+        assert_eq!(item.value, configuration.vertical_font_size_lg.to_string());
+        item.value = "21".to_string();
+
+        let updated = configuration.update(&form, Some(slot));
+
+        assert_eq!(
+            updated,
+            GeneralConfiguration {
+                vertical_font_size_lg: 21,
+                ..configuration
+            }
+        );
+    }
+
+    #[test]
+    fn saved_configs_without_the_separator_setting_show_separators() {
+        let configuration: GeneralConfiguration =
+            ron::from_str("(fix_indicator_size: false, use_iec_units: true)").expect("Config failed to parse");
+        assert!(configuration.show_indicator_separators);
+        assert!(!configuration.fix_indicator_size);
+    }
+
+    #[test]
+    fn font_form_value_round_trips() {
+        for font in [
+            IndicatorFont::System,
+            IndicatorFont::Family("JetBrains Mono".to_string()),
+            IndicatorFont::Family("system".to_string()),
+        ] {
+            assert_eq!(IndicatorFont::from_form_value(&font.to_form_value()), Some(font));
+        }
+    }
+
+    #[test]
+    fn invalid_font_form_values_are_rejected() {
+        assert_eq!(IndicatorFont::from_form_value(""), None);
+        assert_eq!(IndicatorFont::from_form_value("Fira Sans"), None);
+        assert_eq!(IndicatorFont::from_form_value("family:"), None);
+        assert_eq!(IndicatorFont::from_form_value("family:   "), None);
     }
 }

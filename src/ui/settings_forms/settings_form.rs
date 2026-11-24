@@ -1,37 +1,32 @@
-use crate::app::{AppState, Message};
-use crate::configuration::app_configuration::*;
-use crate::core::app_colours::{AppColours, BRIGHT_RED, EXT_WARM_GREY};
+use crate::settings_app::{Message, SettingsApp};
+use crate::core::app_colours::{AppColour, BRIGHT_RED, EXT_WARM_GREY};
 use crate::core::settings::{SettingsForm, SettingsFormInputType};
+use crate::fl;
+use crate::sensors::hwmon_reader::HwmonSensorKind;
 use crate::ui::components::form_checkbox_input::{form_checkbox_input, FormCheckboxInputProps};
+use crate::ui::components::form_dropdown_input::{form_dropdown_input, FormDropdownInputProps};
+use crate::ui::components::form_mount_list_input::{form_mount_list_input, FormMountListInputProps};
+use crate::ui::components::form_spin_button_input::{form_spin_button_input, FormSpinButtonInputProps};
 use crate::ui::components::form_text_input::{form_text_input, FormTextInputProps};
 use crate::ui::components::form_theme_colour_picker_input::{
     form_theme_colour_picker_input, FormThemeColourPickerInputProps,
 };
 use cosmic::iced::Color;
-use cosmic::iced_widget::{container, Container};
-use cosmic::widget::settings;
+use cosmic::iced::widget::{container, Container};
 use cosmic::{widget, Theme};
 
 impl SettingsForm {
-    pub fn draw(&self, app_state: &AppState) -> Container<'_, Message, Theme> {
-        let mut column = widget::list_column().padding(2).spacing(0).divider_padding(2);
+    pub fn draw<'a>(&'a self, app_state: &'a SettingsApp) -> Container<'a, Message, Theme> {
+        let theme = app_state.core().system_theme().cosmic();
+        let mut column = widget::list_column().divider_padding(2);
 
-        let back_button = widget::button::custom(widget::icon::from_name("go-previous-symbolic").size(16).icon())
-            .on_press(Message::SettingsPopupOpened(MAIN_SETTINGS_WINDOW_ID.clone()));
-
-        column = column.add(settings::item(self.title.clone(), back_button));
+        column = column.add(widget::text::title4(self.title.clone()));
 
         for (form_value_key, settings_form_item) in self.values.iter() {
             match settings_form_item.input_type {
                 SettingsFormInputType::String => {
-                    let red_color: Color = app_state
-                        .app_colours()
-                        .get(BRIGHT_RED)
-                        .map_or(Color::WHITE, |c| Color::new(c.red, c.green, c.blue, c.alpha));
-                    let helper_color: Color = app_state
-                        .app_colours()
-                        .get(EXT_WARM_GREY)
-                        .map_or(Color::WHITE, |c| Color::new(c.red, c.green, c.blue, c.alpha));
+                    let red_color: Color = AppColour::Palette(BRIGHT_RED).resolve(theme);
+                    let helper_color: Color = AppColour::Palette(EXT_WARM_GREY).resolve(theme);
 
                     let el = form_text_input(FormTextInputProps {
                         settings_window_id: self.settings_window_id,
@@ -48,10 +43,7 @@ impl SettingsForm {
                 }
                 SettingsFormInputType::CheckBox => {
                     let converted_value = settings_form_item.value.parse::<bool>().unwrap_or(false);
-                    let helper_color: Color = app_state
-                        .app_colours()
-                        .get(EXT_WARM_GREY)
-                        .map_or(Color::WHITE, |c| Color::new(c.red, c.green, c.blue, c.alpha));
+                    let helper_color: Color = AppColour::Palette(EXT_WARM_GREY).resolve(theme);
 
                     let el = form_checkbox_input(FormCheckboxInputProps {
                         settings_window_id: self.settings_window_id,
@@ -65,20 +57,116 @@ impl SettingsForm {
                     column = column.add(el);
                 }
                 SettingsFormInputType::ColourPicker => {
-                    let palette = &app_state.core().system_theme().cosmic().palette;
-                    let app_colours = AppColours::from(palette);
-                    let helper_color: Color = app_state
-                        .app_colours()
-                        .get(EXT_WARM_GREY)
-                        .map_or(Color::WHITE, |c| Color::new(c.red, c.green, c.blue, c.alpha));
+                    let helper_color: Color = AppColour::Palette(EXT_WARM_GREY).resolve(theme);
 
                     let el = form_theme_colour_picker_input(FormThemeColourPickerInputProps {
                         settings_window_id: self.settings_window_id,
                         label: settings_form_item.label.clone(),
-                        selected_key: settings_form_item.value.clone(),
+                        value: &settings_form_item.value,
                         form_value_key,
-                        app_colours,
                         helper_text: settings_form_item.helper_text.clone(),
+                        helper_text_color: helper_color,
+                        custom_picker: app_state.custom_colour_picker(self.settings_window_id, form_value_key),
+                    });
+
+                    column = column.add(el);
+                }
+                SettingsFormInputType::FontPicker => {
+                    let helper_color: Color = AppColour::Palette(EXT_WARM_GREY).resolve(theme);
+
+                    let options = app_state.font_options();
+                    let el = form_dropdown_input(FormDropdownInputProps {
+                        settings_window_id: self.settings_window_id,
+                        label: settings_form_item.label.clone(),
+                        value: &settings_form_item.value,
+                        form_value_key,
+                        labels: options.labels.as_slice(),
+                        values: options.values.clone(),
+                        helper_text: settings_form_item.helper_text.clone(),
+                        helper_text_color: helper_color,
+                    });
+
+                    column = column.add(el);
+                }
+                SettingsFormInputType::SpinButton { min, max } => {
+                    let helper_color: Color = AppColour::Palette(EXT_WARM_GREY).resolve(theme);
+
+                    let el = form_spin_button_input(FormSpinButtonInputProps {
+                        settings_window_id: self.settings_window_id,
+                        label: settings_form_item.label.clone(),
+                        value: settings_form_item.value.trim().parse::<u16>().unwrap_or(min),
+                        min,
+                        max,
+                        form_value_key,
+                        helper_text: settings_form_item.helper_text.clone(),
+                        helper_text_color: helper_color,
+                    });
+
+                    column = column.add(el);
+                }
+                SettingsFormInputType::MountList => {
+                    let helper_color: Color = AppColour::Palette(EXT_WARM_GREY).resolve(theme);
+
+                    let rows = form_mount_list_input(FormMountListInputProps {
+                        settings_window_id: self.settings_window_id,
+                        label: settings_form_item.label.clone(),
+                        value: &settings_form_item.value,
+                        form_value_key,
+                        options: app_state.mount_options(),
+                        helper_text: settings_form_item.helper_text.clone(),
+                        helper_text_color: helper_color,
+                    });
+
+                    for row in rows {
+                        column = column.add(row);
+                    }
+                }
+                SettingsFormInputType::SensorPicker(kind) => {
+                    let helper_color: Color = AppColour::Palette(EXT_WARM_GREY).resolve(theme);
+                    let options = app_state.sensor_options(kind);
+
+                    // Without any sensors, the choice is moot, so explain why there are none instead.
+                    let helper_text = if options.has_sensors {
+                        settings_form_item.helper_text.clone()
+                    } else {
+                        Some(match kind {
+                            HwmonSensorKind::Temperature => fl!("settings-cpu-no-temperature-sensors"),
+                            HwmonSensorKind::Fan => fl!("settings-cpu-no-fan-sensors"),
+                        })
+                    };
+
+                    let el = form_dropdown_input(FormDropdownInputProps {
+                        settings_window_id: self.settings_window_id,
+                        label: settings_form_item.label.clone(),
+                        value: &settings_form_item.value,
+                        form_value_key,
+                        labels: options.labels.as_slice(),
+                        values: options.values.clone(),
+                        helper_text,
+                        helper_text_color: helper_color,
+                    });
+
+                    column = column.add(el);
+                }
+                SettingsFormInputType::GpuPicker => {
+                    let helper_color: Color = AppColour::Palette(EXT_WARM_GREY).resolve(theme);
+                    let options = app_state.gpu_options();
+
+                    // Without any GPUs, the choice is moot, so explain why there are none instead.
+                    let helper_text = if options.has_gpus {
+                        settings_form_item.helper_text.clone()
+                    } else {
+                        Some(fl!("settings-gpu-none"))
+                    };
+
+                    let el = form_dropdown_input(FormDropdownInputProps {
+                        settings_window_id: self.settings_window_id,
+                        label: settings_form_item.label.clone(),
+                        value: &settings_form_item.value,
+                        form_value_key,
+                        labels: options.labels.as_slice(),
+                        values: options.values.clone(),
+                        helper_text,
                         helper_text_color: helper_color,
                     });
 
@@ -87,6 +175,6 @@ impl SettingsForm {
             };
         }
 
-        container(column)
+        container(column).padding(2)
     }
 }
